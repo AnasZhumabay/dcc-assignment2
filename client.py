@@ -259,18 +259,35 @@ def main():
     stub = counter_pb2_grpc.CounterStub(channel)
 
     if args.command == "incr":
-        response = increment_counter(
-            stub,
+        result = quorum_increment(
             args.counter_id,
             args.by,
-            args.key,
-            clock
+            key=args.key,
+            clock=clock
         )
 
-        print(
-            f"OK value={response.new_value} "
-            f"duplicate={response.was_duplicate}"
-        )
+        responses = list(result["responses"].values())
+
+        if result["committed"]:
+            value = responses[0].new_value
+
+            duplicate = all(
+                response.was_duplicate
+                for response in responses
+            )
+
+            print(
+                f"OK committed value={value} "
+                f"(replicas acked: {result['ack_count']}/3, "
+                f"duplicate: {'yes' if duplicate else 'no'})"
+            )
+
+        else:
+            print(
+                f"FAILED not committed "
+                f"(replicas acked: {result['ack_count']}/3)"
+            )
+            raise SystemExit(1)
 
     elif args.command == "get":
         response = get_counter(
