@@ -6,26 +6,59 @@ import grpc
 
 import counter_pb2
 import counter_pb2_grpc
+from clocks import LamportClock
 
 
-def increment_counter(stub, counter_id, delta, key=None):
+def increment_counter(
+    stub,
+    counter_id,
+    delta,
+    key=None,
+    clock=None,
+    name="client-1"
+):
     if key is None:
         key = str(uuid.uuid4())
 
-    request = counter_pb2.IncrementRequest(
-        counter_id=counter_id,
-        delta=delta,
-        idempotency_key=key
-    )
+    if clock is None:
+        clock = LamportClock()
 
     backoff_times = [0.2, 0.4, 0.8]
 
     for attempt in range(4):
+        send_time = clock.tick()
+
+        request = counter_pb2.IncrementRequest(
+            counter_id=counter_id,
+            delta=delta,
+            idempotency_key=key,
+            lamport_time=send_time
+        )
+
+        print(
+            f"[{name}] SEND "
+            f"Increment(counter={counter_id}, delta={delta}) "
+            f"L={send_time}"
+        )
+
         try:
-            return stub.Increment(
+            response = stub.Increment(
                 request,
                 timeout=2.0
             )
+
+            recv_time = clock.update(
+                response.lamport_time
+            )
+
+            print(
+                f"[{name}] RECV "
+                f"IncrementReply(new_value={response.new_value}) "
+                f"L={recv_time} "
+                f"(received L={response.lamport_time})"
+            )
+
+            return response
 
         except grpc.RpcError as error:
             retryable = error.code() in (
@@ -39,19 +72,49 @@ def increment_counter(stub, counter_id, delta, key=None):
             time.sleep(backoff_times[attempt])
 
 
-def get_counter(stub, counter_id):
-    request = counter_pb2.GetRequest(
-        counter_id=counter_id
-    )
+def get_counter(
+    stub,
+    counter_id,
+    clock=None,
+    name="client-1"
+):
+    if clock is None:
+        clock = LamportClock()
 
     backoff_times = [0.2, 0.4, 0.8]
 
     for attempt in range(4):
+        send_time = clock.tick()
+
+        request = counter_pb2.GetRequest(
+            counter_id=counter_id,
+            lamport_time=send_time
+        )
+
+        print(
+            f"[{name}] SEND "
+            f"Get(counter={counter_id}) "
+            f"L={send_time}"
+        )
+
         try:
-            return stub.Get(
+            response = stub.Get(
                 request,
                 timeout=2.0
             )
+
+            recv_time = clock.update(
+                response.lamport_time
+            )
+
+            print(
+                f"[{name}] RECV "
+                f"GetReply(value={response.value}, found={response.found}) "
+                f"L={recv_time} "
+                f"(received L={response.lamport_time})"
+            )
+
+            return response
 
         except grpc.RpcError as error:
             retryable = error.code() in (
@@ -95,6 +158,7 @@ def main():
     get_parser.add_argument("counter_id")
 
     args = parser.parse_args()
+    clock = LamportClock()
 
     channel = grpc.insecure_channel(
         f"localhost:{args.port}"
@@ -107,7 +171,8 @@ def main():
             stub,
             args.counter_id,
             args.by,
-            args.key
+            args.key,
+            clock
         )
 
         print(
@@ -118,7 +183,8 @@ def main():
     elif args.command == "get":
         response = get_counter(
             stub,
-            args.counter_id
+            args.counter_id,
+            clock
         )
 
         if response.found:
