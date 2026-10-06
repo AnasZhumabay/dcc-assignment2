@@ -16,26 +16,42 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
         self._seen = {}
         self._clock = LamportClock()
         self._name = name
+        self._log_lock = threading.Lock()
+        self._event_lock = threading.Lock()
+
+    def _log(self, message):
+        with self._log_lock:
+            print(message, flush=True)
+
+    def _recv_event(self, received_time, message):
+        with self._event_lock:
+            event_time = self._clock.update(received_time)
+            self._log(
+                f"{message} L={event_time} "
+                f"(received L={received_time})"
+            )
+            return event_time
+
+    def _local_event(self, message):
+        with self._event_lock:
+            event_time = self._clock.tick()
+            self._log(f"{message} L={event_time}")
+            return event_time
 
     def Increment(self, request, context):
-        recv_time = self._clock.update(request.lamport_time)
-
-        print(
+        recv_time = self._recv_event(
+            request.lamport_time,
             f"[{self._name}] RECV "
-            f"Increment(counter={request.counter_id}, delta={request.delta}) "
-            f"L={recv_time} (received L={request.lamport_time})"
+            f"Increment(counter={request.counter_id}, delta={request.delta})"
         )
 
         with self._lock:
             if request.idempotency_key in self._seen:
                 _, stored_value = self._seen[request.idempotency_key]
 
-                send_time = self._clock.tick()
-
-                print(
+                send_time = self._local_event(
                     f"[{self._name}] SEND "
-                    f"IncrementReply(new_value={stored_value}) "
-                    f"L={send_time}"
+                    f"IncrementReply(new_value={stored_value})"
                 )
 
                 return counter_pb2.IncrementReply(
@@ -47,26 +63,24 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
             current_value = self._values.get(request.counter_id, 0)
             new_value = current_value + request.delta
 
-            self._values[request.counter_id] = new_value
-            self._seen[request.idempotency_key] = (
-                request.counter_id,
-                new_value
-            )
+            with self._event_lock:
+                apply_time = self._clock.tick()
 
-            apply_time = self._clock.tick()
+                self._values[request.counter_id] = new_value
+                self._seen[request.idempotency_key] = (
+                    request.counter_id,
+                    new_value
+                )
 
-            print(
-                f"[{self._name}] APPLY "
-                f"counter={request.counter_id} -> {new_value} "
-                f"L={apply_time}"
-            )
+                self._log(
+                    f"[{self._name}] APPLY "
+                    f"counter={request.counter_id} -> {new_value} "
+                    f"L={apply_time}"
+                )
 
-            send_time = self._clock.tick()
-
-            print(
+            send_time = self._local_event(
                 f"[{self._name}] SEND "
-                f"IncrementReply(new_value={new_value}) "
-                f"L={send_time}"
+                f"IncrementReply(new_value={new_value})"
             )
 
             return counter_pb2.IncrementReply(
@@ -76,12 +90,10 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
             )
 
     def Get(self, request, context):
-        recv_time = self._clock.update(request.lamport_time)
-
-        print(
+        recv_time = self._recv_event(
+            request.lamport_time,
             f"[{self._name}] RECV "
-            f"Get(counter={request.counter_id}) "
-            f"L={recv_time} (received L={request.lamport_time})"
+            f"Get(counter={request.counter_id})"
         )
 
         with self._lock:
@@ -92,12 +104,9 @@ class CounterServicer(counter_pb2_grpc.CounterServicer):
                 value = 0
                 found = False
 
-        send_time = self._clock.tick()
-
-        print(
+        send_time = self._local_event(
             f"[{self._name}] SEND "
-            f"GetReply(value={value}, found={found}) "
-            f"L={send_time}"
+            f"GetReply(value={value}, found={found})"
         )
 
         return counter_pb2.GetReply(
