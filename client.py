@@ -1,12 +1,16 @@
 import argparse
 import time
 import uuid
+from concurrent import futures
 
 import grpc
 
 import counter_pb2
 import counter_pb2_grpc
 from clocks import LamportClock
+
+
+DEFAULT_REPLICA_PORTS = (50051, 50052, 50053)
 
 
 def increment_counter(
@@ -126,6 +130,94 @@ def get_counter(
                 raise
 
             time.sleep(backoff_times[attempt])
+
+
+def _increment_replica(
+    port,
+    counter_id,
+    delta,
+    key,
+    clock,
+    name
+):
+    channel = grpc.insecure_channel(
+        f"localhost:{port}"
+    )
+
+    try:
+        stub = counter_pb2_grpc.CounterStub(channel)
+
+        response = increment_counter(
+            stub,
+            counter_id,
+            delta,
+            key=key,
+            clock=clock,
+            name=name
+        )
+
+        return port, response
+
+    finally:
+        channel.close()
+
+
+def quorum_increment(
+    counter_id,
+    delta,
+    key=None,
+    ports=DEFAULT_REPLICA_PORTS,
+    clock=None,
+    name="client-1"
+):
+    if key is None:
+        key = str(uuid.uuid4())
+
+    if clock is None:
+        clock = LamportClock()
+
+    ports = tuple(ports)
+    required = len(ports) // 2 + 1
+
+    acknowledgements = {}
+    errors = {}
+
+    with futures.ThreadPoolExecutor(
+        max_workers=len(ports)
+    ) as executor:
+        future_to_port = {
+            executor.submit(
+                _increment_replica,
+                port,
+                counter_id,
+                delta,
+                key,
+                clock,
+                name
+            ): port
+            for port in ports
+        }
+
+        for future in futures.as_completed(future_to_port):
+            port = future_to_port[future]
+
+            try:
+                _, response = future.result()
+                acknowledgements[port] = response
+
+            except grpc.RpcError as error:
+                errors[port] = error.code()
+
+    committed = len(acknowledgements) >= required
+
+    return {
+        "committed": committed,
+        "ack_count": len(acknowledgements),
+        "required": required,
+        "responses": acknowledgements,
+        "errors": errors,
+        "key": key
+    }
 
 
 def main():
